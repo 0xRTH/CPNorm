@@ -111,6 +111,21 @@ func printResult(format string, args ...interface{}) {
 	fmt.Printf(format+"\n", args...)
 }
 
+func printVerbose(format string, args ...interface{}) {
+	if !*verbose {
+		return
+	}
+	consoleMutex.Lock()
+	defer consoleMutex.Unlock()
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func printError(format string, args ...interface{}) {
+	consoleMutex.Lock()
+	defer consoleMutex.Unlock()
+	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
+}
+
 func main() {
 	useProxy := flag.Bool("proxy", false, "Use local proxy (127.0.0.1:8080)")
 	verbose = flag.Bool("v", false, "Enable verbose output")
@@ -161,7 +176,7 @@ func main() {
 
 	// Initialize connection pool by pre-warming
 	if *verbose {
-		fmt.Println("Initializing connection pool...")
+		printVerbose("Initializing connection pool...")
 	}
 	warmupDone := make(chan bool)
 	go func() {
@@ -176,6 +191,8 @@ func main() {
 					conn, err := client.Dial("example.com" + port)
 					if err == nil {
 						conn.Close()
+					} else {
+						printError("Connection pool warmup error: %v", err)
 					}
 				}
 			}()
@@ -188,11 +205,11 @@ func main() {
 	select {
 	case <-warmupDone:
 		if *verbose {
-			fmt.Println("Connection pool initialized")
+			printVerbose("Connection pool initialized")
 		}
 	case <-time.After(5 * time.Second):
 		if *verbose {
-			fmt.Println("Connection pool warmup timed out")
+			printVerbose("Connection pool warmup timed out")
 		}
 	}
 
@@ -200,6 +217,7 @@ func main() {
 		client.Dial = func(addr string) (net.Conn, error) {
 			proxyConn, err := net.Dial("tcp", "127.0.0.1:8080")
 			if err != nil {
+				printError("Proxy connection error: %v", err)
 				return nil, err
 			}
 
@@ -212,10 +230,12 @@ func main() {
 			res, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
 			if err != nil {
 				proxyConn.Close()
+				printError("Proxy response error: %v", err)
 				return nil, err
 			}
 			if res.StatusCode != 200 {
 				proxyConn.Close()
+				printError("Proxy error: %s", res.Status)
 				return nil, fmt.Errorf("proxy error: %s", res.Status)
 			}
 
@@ -411,14 +431,12 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	}
 	clearLine()
 	if err != nil {
-		if *verbose {
-			fmt.Printf("Error making second request to %s: %v\n", newURL, err)
-		}
+		printError("Making request to %s: %v", newURL, err)
 		return false
 	}
 	if len1 != len2 {
 		if *verbose {
-			fmt.Printf("Lengths differ for %s, continuing to next payload\n", newURL)
+			printVerbose("Lengths differ for %s, continuing to next payload", newURL)
 		}
 		return false
 	}
@@ -450,9 +468,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	}
 	clearLine()
 	if err != nil {
-		if *verbose {
-			fmt.Printf("Error making third request to %s: %v\n", finalURL, err)
-		}
+		printError("Making request to %s: %v", finalURL, err)
 		return false
 	}
 
@@ -461,12 +477,37 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 		// Only report if difference is more than 30 chars
 		if abs(len2-len3) > 30 {
 			if *verbose {
-				fmt.Printf("Verifying potential issue for %s\n", targetURL)
+				printVerbose("Verifying potential issue for %s", targetURL)
+			}
+
+			// Make a request with the same cache buster but without the payload
+			baseURLWithoutPayload := targetURL
+			if qIdx := strings.Index(baseURLWithoutPayload, "?"); qIdx != -1 {
+				baseURLWithoutPayload = baseURLWithoutPayload[:qIdx]
+			}
+			verifyURL := baseURLWithoutPayload + "?zzz=" + randomStr
+			printProgress("%s (no-payload verification)", verifyURL)
+			lenVerifyNoPayload, respVerifyNoPayload, err := makeRequest(client, verifyURL)
+			if respVerifyNoPayload != nil {
+				defer fasthttp.ReleaseResponse(respVerifyNoPayload)
+			}
+			clearLine()
+
+			if err != nil {
+				printError("Making verification request to %s: %v", verifyURL, err)
+			} else {
+				// If the response with cache buster but no payload is similar to the response with payload and cache buster,
+				// this indicates the size difference is not due to the payload
+				if abs(len3-lenVerifyNoPayload) <= 30 {
+					// High probability - the size difference is due to the payload
+					printResult("[HIGH_PROBABILITY] Potential issue at %s with payload '%s' - len1=%d len2=%d len3=%d", targetURL, payload, len1, len2, len3)
+					return true
+				}
 			}
 
 			// Recheck with a different random parameter
 			randomStrVerify := randString(8)
-			verifyURL := baseURL + "?zzz=" + randomStrVerify
+			verifyURL = baseURL + "?zzz=" + randomStrVerify
 			printProgress("%s (verification)", verifyURL)
 			len3Verify, resp3Verify, err := makeRequest(client, verifyURL)
 			if resp3Verify != nil {
@@ -474,13 +515,15 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 			}
 			clearLine()
 
-			if err == nil && abs(len2-len3Verify) > 30 {
+			if err != nil {
+				printError("Making verification request to %s: %v", verifyURL, err)
+			} else if abs(len2-len3Verify) > 30 {
 				printResult("Potential issue at %s with payload '%s' - len1=%d len2=%d len3=%d", targetURL, payload, len1, len2, len3)
 				return true
 			}
 
 			if *verbose {
-				fmt.Printf("Issue not verified for %s, continuing with other payloads\n", targetURL)
+				printVerbose("Issue not verified for %s, continuing with other payloads", targetURL)
 			}
 		}
 	}
